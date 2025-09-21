@@ -82,6 +82,7 @@ from krypnova.utils.reaction_metrics import compute_decision_confidence,recommen
 from krypnova.tactics.pattern_attack_executor import PatternAttackExecutor
 from krypnova.models.strategy_performance import StrategyPerformanceLog
 from krypnova.ai.portfolio_optimizer import PortfolioOptimizer
+from decision_mapper import DecisionMapper, make_portfolio_enhanced_decision
 from analytics.top_movers import TopMoversFetcher
 from analytics.hidden_opportunities import detect_hidden_gems_advanced
 from offensive_selector import OffensiveSelector
@@ -2865,6 +2866,22 @@ class ExionBrain:
                     "reason": "No se encontraron oportunidades claras o la defensa bloquea/espera la operación.",
                     "strategy_used": "N/A"
                 }
+                
+                # Enhance hold decision with portfolio analysis
+                try:
+                    enhanced_hold_result = await make_portfolio_enhanced_decision(
+                        symbol=symbol,
+                        individual_analysis=hold_result,
+                        portfolio=portfolio,
+                        context=context,
+                        logger=logger
+                    )
+                    if enhanced_hold_result.get("portfolio_enhanced", False):
+                        hold_result = enhanced_hold_result
+                        logger.info(f"✅ Portfolio-enhanced hold decision for {symbol}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Portfolio enhancement failed for hold decision on {symbol}: {e}")
+                
                 user_id = context.get("user_id", "unknown")
                 await save_decision_db(self, user_id, symbol, hold_result.get("decision"), context, hold_result)
                 await self.record_action(
@@ -2943,6 +2960,24 @@ class ExionBrain:
                 except Exception as e:
                     logger.error(f"❌ Error ejecutando orden para {valid_analysis.get('symbol', symbol)}: {e}")
                     valid_analysis["execution_result"] = {"error": str(e)}
+
+            # Enhance decision with portfolio optimization
+            try:
+                enhanced_analysis = await make_portfolio_enhanced_decision(
+                    symbol=symbol,
+                    individual_analysis=valid_analysis,
+                    portfolio=portfolio,
+                    context=context,
+                    logger=logger
+                )
+                # Use enhanced analysis if successful, otherwise fall back to original
+                if enhanced_analysis.get("portfolio_enhanced", False):
+                    valid_analysis = enhanced_analysis
+                    logger.info(f"✅ Portfolio-enhanced decision for {symbol}: {valid_analysis.get('decision')} (confidence: {valid_analysis.get('confidence', 0):.2%})")
+                else:
+                    logger.info(f"ℹ️ Portfolio enhancement not available for {symbol}, using individual analysis")
+            except Exception as e:
+                logger.warning(f"⚠️ Portfolio enhancement failed for {symbol}: {e}, using individual analysis")
 
             user_id = context.get("user_id", "unknown")
             await save_decision_db(self, user_id, symbol, valid_analysis.get("decision"), context, valid_analysis)
