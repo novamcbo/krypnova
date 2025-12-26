@@ -1622,7 +1622,7 @@ class ExionBrain:
             backtest_result: dict = None,
             trades_df: pd.DataFrame = None,  # para métricas de backtest (profit por trade)
             perf_df: pd.DataFrame = None,  # para curva de equity (columna 'total')
-            clones_manager = None
+            clones_manager = None,
     ) -> dict:
         """
         Orquesta señales, riesgo, estrategias y ROI combinado.
