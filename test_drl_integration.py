@@ -75,8 +75,8 @@ def test_drl_integration_in_calculate_roi_metrics():
     assert 'direction_with_drl' in code, "direction_with_drl field not in output"
     print("   ✓ direction_with_drl field in output")
     
-    assert 'drl_consensus_strength' in code, "drl_consensus_strength field not in output"
-    print("   ✓ drl_consensus_strength field in output")
+    assert 'consensus_confidence_ratio' in code, "consensus_confidence_ratio field not in output"
+    print("   ✓ consensus_confidence_ratio field in output")
     
     # Check for DRL predictions in detail
     assert 'drl_predictions' in code, "drl_predictions not in detail"

@@ -1562,7 +1562,11 @@ class ExionBrain:
                         q_values = self.dqn_agent.model.predict(state, verbose=0)
                         max_q = np.max(q_values)
                         mean_q = np.mean(q_values)
-                        drl_predictions["dqn_confidence"] = float(max_q / (mean_q + 1e-8)) if mean_q != 0 else 0.5
+                        std_q = np.std(q_values) + 1e-8
+                        # Use normalized confidence metric based on how much max_q exceeds mean
+                        confidence_raw = (max_q - mean_q) / std_q
+                        # Normalize to [0, 1] range using sigmoid-like function
+                        drl_predictions["dqn_confidence"] = float(1.0 / (1.0 + np.exp(-confidence_raw)))
                     else:
                         drl_predictions["dqn_confidence"] = 0.5
                     self.logger.info(f"[{symbol}] DQN prediction: {drl_predictions['dqn_action']} (confidence: {drl_predictions['dqn_confidence']:.3f})")
@@ -1576,11 +1580,23 @@ class ExionBrain:
                     ppo_action, ppo_log_prob = self.ppo_agent.act(state)
                     # Map action index to decision (0: hold, 1: buy, 2: sell)
                     ppo_action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
-                    ppo_action_idx = int(ppo_action) if hasattr(ppo_action, "__int__") else 0
-                    drl_predictions["ppo_action"] = ppo_action_map.get(ppo_action_idx, "HOLD")
-                    # Use log probability as confidence indicator
-                    drl_predictions["ppo_confidence"] = float(np.exp(ppo_log_prob)) if ppo_log_prob is not None else 0.5
-                    self.logger.info(f"[{symbol}] PPO prediction: {drl_predictions['ppo_action']} (confidence: {drl_predictions['ppo_confidence']:.3f})")
+                    try:
+                        ppo_action_idx = int(ppo_action)
+                    except (ValueError, TypeError):
+                        self.logger.warning(f"[{symbol}] Invalid PPO action type: {type(ppo_action)}, defaulting to HOLD")
+                        drl_predictions["errors"].append(f"Invalid PPO action type: {type(ppo_action)}")
+                        ppo_action_idx = None
+                    
+                    if ppo_action_idx is not None:
+                        drl_predictions["ppo_action"] = ppo_action_map.get(ppo_action_idx, "HOLD")
+                        # Use log probability as confidence indicator with numerical stability
+                        if ppo_log_prob is not None:
+                            # Clamp to prevent overflow and normalize to [0, 1]
+                            clamped_log_prob = min(max(ppo_log_prob, -10.0), 0.0)
+                            drl_predictions["ppo_confidence"] = float(min(np.exp(clamped_log_prob), 1.0))
+                        else:
+                            drl_predictions["ppo_confidence"] = 0.5
+                        self.logger.info(f"[{symbol}] PPO prediction: {drl_predictions['ppo_action']} (confidence: {drl_predictions['ppo_confidence']:.3f})")
             except Exception as e:
                 self.logger.warning(f"[{symbol}] PPO prediction failed: {e}")
                 drl_predictions["errors"].append(f"PPO error: {e}")
@@ -1860,7 +1876,8 @@ class ExionBrain:
                     # Update combined_result with DRL-enhanced direction
                     original_direction = combined_result.get("direction", "NEUTRAL")
                     combined_result["direction_with_drl"] = consensus_action
-                    combined_result["drl_consensus_strength"] = action_votes[consensus_action] / (total_confidence + 1e-8)
+                    # Calculate the proportion of confidence supporting the winning action
+                    combined_result["consensus_confidence_ratio"] = action_votes[consensus_action] / (total_confidence + 1e-8)
                     
                     # Update signals_used to include DRL
                     combined_result["signals_used"] = signals
@@ -1882,7 +1899,7 @@ class ExionBrain:
                     
                     self.logger.info(
                         f"[{symbol}] DRL Integration - Original: {original_direction}, "
-                        f"DRL-Enhanced: {consensus_action}, Consensus strength: {combined_result['drl_consensus_strength']:.3f}"
+                        f"DRL-Enhanced: {consensus_action}, Consensus confidence ratio: {combined_result['consensus_confidence_ratio']:.3f}"
                     )
             else:
                 # Fallback: No DRL predictions available
@@ -1916,7 +1933,7 @@ class ExionBrain:
                 "roi_total": combined_result.get("roi_total", 0.0),
                 "direction": combined_result.get("direction", "NEUTRAL"),
                 "direction_with_drl": combined_result.get("direction_with_drl", combined_result.get("direction", "NEUTRAL")),
-                "drl_consensus_strength": combined_result.get("drl_consensus_strength", 0.0),
+                "consensus_confidence_ratio": combined_result.get("consensus_confidence_ratio", 0.0),
                 "signals_used": combined_result.get("signals_used", []),
                 "detail": combined_result.get("detail", {}),
                 "risk_metrics": risk_metrics,
