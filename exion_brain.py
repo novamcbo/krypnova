@@ -1505,6 +1505,112 @@ class ExionBrain:
             "signal_strength": signal_strength
         }
 
+    async def _get_drl_predictions(
+            self,
+            symbol: str,
+            df: pd.DataFrame,
+            context: dict = None
+    ) -> dict:
+        """
+        Get action predictions from DQN and PPO agents.
+        Returns a dict with DQN and PPO predictions, or None if models fail.
+        Includes fallback behavior if models are unavailable.
+        """
+        drl_predictions = {
+            "dqn_action": None,
+            "dqn_confidence": 0.0,
+            "ppo_action": None,
+            "ppo_confidence": 0.0,
+            "available": False,
+            "errors": []
+        }
+
+        try:
+            # Check if agents are available
+            if not hasattr(self, "dqn_agent") or not hasattr(self, "ppo_agent"):
+                self.logger.warning(f"[{symbol}] DRL agents not initialized")
+                drl_predictions["errors"].append("DRL agents not initialized")
+                return drl_predictions
+
+            # Prepare state from dataframe
+            # Use last STATE_SIZE features from the dataframe
+            if len(df) < STATE_SIZE:
+                self.logger.warning(f"[{symbol}] Insufficient data for DRL state (need {STATE_SIZE}, got {len(df)})")
+                drl_predictions["errors"].append(f"Insufficient data for DRL state")
+                return drl_predictions
+
+            # Extract state features (last STATE_SIZE rows of normalized close prices)
+            try:
+                close_prices = df["close"].tail(STATE_SIZE).values
+                # Normalize the state
+                state = (close_prices - np.mean(close_prices)) / (np.std(close_prices) + 1e-8)
+                state = state.reshape(1, -1) if len(state.shape) == 1 else state
+            except Exception as e:
+                self.logger.warning(f"[{symbol}] Error preparing DRL state: {e}")
+                drl_predictions["errors"].append(f"State preparation error: {e}")
+                return drl_predictions
+
+            # Get DQN prediction
+            try:
+                if hasattr(self.dqn_agent, "act"):
+                    dqn_action = self.dqn_agent.act(state, training=False)
+                    # Map action index to decision (0: hold, 1: buy, 2: sell)
+                    dqn_action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
+                    drl_predictions["dqn_action"] = dqn_action_map.get(dqn_action, "HOLD")
+                    # Get confidence from Q-values if available
+                    if hasattr(self.dqn_agent, "model") and hasattr(self.dqn_agent.model, "predict"):
+                        q_values = self.dqn_agent.model.predict(state, verbose=0)
+                        max_q = np.max(q_values)
+                        mean_q = np.mean(q_values)
+                        std_q = np.std(q_values) + 1e-8
+                        # Use normalized confidence metric based on how much max_q exceeds mean
+                        confidence_raw = (max_q - mean_q) / std_q
+                        # Normalize to [0, 1] range using sigmoid-like function
+                        drl_predictions["dqn_confidence"] = float(1.0 / (1.0 + np.exp(-confidence_raw)))
+                    else:
+                        drl_predictions["dqn_confidence"] = 0.5
+                    self.logger.info(f"[{symbol}] DQN prediction: {drl_predictions['dqn_action']} (confidence: {drl_predictions['dqn_confidence']:.3f})")
+            except Exception as e:
+                self.logger.warning(f"[{symbol}] DQN prediction failed: {e}")
+                drl_predictions["errors"].append(f"DQN error: {e}")
+
+            # Get PPO prediction
+            try:
+                if hasattr(self.ppo_agent, "act"):
+                    ppo_action, ppo_log_prob = self.ppo_agent.act(state)
+                    # Map action index to decision (0: hold, 1: buy, 2: sell)
+                    ppo_action_map = {0: "HOLD", 1: "BUY", 2: "SELL"}
+                    try:
+                        ppo_action_idx = int(ppo_action)
+                    except (ValueError, TypeError):
+                        self.logger.warning(f"[{symbol}] Invalid PPO action type: {type(ppo_action)}, defaulting to HOLD")
+                        drl_predictions["errors"].append(f"Invalid PPO action type: {type(ppo_action)}")
+                        ppo_action_idx = None
+                    
+                    if ppo_action_idx is not None:
+                        drl_predictions["ppo_action"] = ppo_action_map.get(ppo_action_idx, "HOLD")
+                        # Use log probability as confidence indicator with numerical stability
+                        if ppo_log_prob is not None:
+                            # Clamp to prevent overflow and normalize to [0, 1]
+                            clamped_log_prob = min(max(ppo_log_prob, -10.0), 0.0)
+                            drl_predictions["ppo_confidence"] = float(min(np.exp(clamped_log_prob), 1.0))
+                        else:
+                            drl_predictions["ppo_confidence"] = 0.5
+                        self.logger.info(f"[{symbol}] PPO prediction: {drl_predictions['ppo_action']} (confidence: {drl_predictions['ppo_confidence']:.3f})")
+            except Exception as e:
+                self.logger.warning(f"[{symbol}] PPO prediction failed: {e}")
+                drl_predictions["errors"].append(f"PPO error: {e}")
+
+            # Mark as available if at least one prediction succeeded
+            drl_predictions["available"] = (drl_predictions["dqn_action"] is not None or 
+                                           drl_predictions["ppo_action"] is not None)
+
+        except Exception as e:
+            self.logger.error(f"[{symbol}] Unexpected error in _get_drl_predictions: {e}", exc_info=True)
+            drl_predictions["errors"].append(f"Unexpected error: {e}")
+
+        return drl_predictions
+
     async def calculate_roi_metrics(
             self,
             symbol: str,
@@ -1513,8 +1619,10 @@ class ExionBrain:
             *,
             strategies: list = None,
             context: dict = None,
+            backtest_result: dict = None,
             trades_df: pd.DataFrame = None,  # para métricas de backtest (profit por trade)
-            perf_df: pd.DataFrame = None  # para curva de equity (columna 'total')
+            perf_df: pd.DataFrame = None,  # para curva de equity (columna 'total')
+            clones_manager = None,
     ) -> dict:
         """
         Orquesta señales, riesgo, estrategias y ROI combinado.
@@ -1716,6 +1824,93 @@ class ExionBrain:
                         combined_result = {"roi_total": 0.0, "direction": "NEUTRAL", "signals_used": [], "detail": {}}
                         errors.append(f"combine_signals_roi: {e}")
 
+            # 5.5) Get DRL predictions (DQN and PPO) and integrate with strategy outputs
+            drl_predictions = await self._get_drl_predictions(symbol, df, context)
+            
+            # Log DRL contributions for debugging
+            if drl_predictions.get("available"):
+                self.logger.info(
+                    f"[{symbol}] DRL Predictions - DQN: {drl_predictions.get('dqn_action')} "
+                    f"(conf: {drl_predictions.get('dqn_confidence', 0):.3f}), "
+                    f"PPO: {drl_predictions.get('ppo_action')} "
+                    f"(conf: {drl_predictions.get('ppo_confidence', 0):.3f})"
+                )
+                
+                # Integrate DRL predictions with combined_result
+                # Add DRL predictions as additional signals
+                if drl_predictions.get("dqn_action"):
+                    signals.append({
+                        "name": "DQNAgent",
+                        "action": drl_predictions["dqn_action"],
+                        "roi": 0.0,  # DRL doesn't directly provide ROI
+                        "confidence": drl_predictions["dqn_confidence"]
+                    })
+                
+                if drl_predictions.get("ppo_action"):
+                    signals.append({
+                        "name": "PPOAgent",
+                        "action": drl_predictions["ppo_action"],
+                        "roi": 0.0,  # DRL doesn't directly provide ROI
+                        "confidence": drl_predictions["ppo_confidence"]
+                    })
+                
+                # Recalculate combined result with DRL predictions
+                if signals:  # Only if we have any signals (including DRL)
+                    # Calculate consensus direction from all signals
+                    action_votes = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0, "LONG": 0.0, "SHORT": 0.0}
+                    total_confidence = 0.0
+                    
+                    for sig in signals:
+                        action = sig.get("action", "HOLD").upper()
+                        confidence = sig.get("confidence", 0.5)
+                        # Normalize action names
+                        if action in ["BUY", "LONG"]:
+                            action_votes["BUY"] += confidence
+                        elif action in ["SELL", "SHORT"]:
+                            action_votes["SELL"] += confidence
+                        else:
+                            action_votes["HOLD"] += confidence
+                        total_confidence += confidence
+                    
+                    # Determine consensus direction
+                    consensus_action = max(action_votes.items(), key=lambda x: x[1])[0]
+                    
+                    # Update combined_result with DRL-enhanced direction
+                    original_direction = combined_result.get("direction", "NEUTRAL")
+                    combined_result["direction_with_drl"] = consensus_action
+                    # Calculate the proportion of confidence supporting the winning action
+                    combined_result["consensus_confidence_ratio"] = action_votes[consensus_action] / (total_confidence + 1e-8)
+                    
+                    # Update signals_used to include DRL
+                    combined_result["signals_used"] = signals
+                    
+                    # Add DRL detail to output
+                    combined_result["detail"]["drl_predictions"] = {
+                        "dqn": {
+                            "action": drl_predictions.get("dqn_action"),
+                            "confidence": drl_predictions.get("dqn_confidence", 0.0)
+                        },
+                        "ppo": {
+                            "action": drl_predictions.get("ppo_action"),
+                            "confidence": drl_predictions.get("ppo_confidence", 0.0)
+                        },
+                        "original_direction": original_direction,
+                        "enhanced_direction": consensus_action,
+                        "action_votes": action_votes
+                    }
+                    
+                    self.logger.info(
+                        f"[{symbol}] DRL Integration - Original: {original_direction}, "
+                        f"DRL-Enhanced: {consensus_action}, Consensus confidence ratio: {combined_result['consensus_confidence_ratio']:.3f}"
+                    )
+            else:
+                # Fallback: No DRL predictions available
+                self.logger.info(f"[{symbol}] DRL predictions not available, using strategy-only predictions")
+                combined_result["detail"]["drl_predictions"] = {
+                    "available": False,
+                    "errors": drl_predictions.get("errors", [])
+                }
+
             # 6) Métricas de backtest (Sharpe, win-rate, drawdown, CAGR, etc.)
             try:
                 backtest_metrics = await compile_backtest_metrics(perf_df or pd.DataFrame(),
@@ -1739,6 +1934,8 @@ class ExionBrain:
             output = {
                 "roi_total": combined_result.get("roi_total", 0.0),
                 "direction": combined_result.get("direction", "NEUTRAL"),
+                "direction_with_drl": combined_result.get("direction_with_drl", combined_result.get("direction", "NEUTRAL")),
+                "consensus_confidence_ratio": combined_result.get("consensus_confidence_ratio", 0.0),
                 "signals_used": combined_result.get("signals_used", []),
                 "detail": combined_result.get("detail", {}),
                 "risk_metrics": risk_metrics,
