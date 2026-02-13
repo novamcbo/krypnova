@@ -1,0 +1,1 @@
+# Krypnova package initialization
